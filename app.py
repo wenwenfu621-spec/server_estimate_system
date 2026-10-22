@@ -227,7 +227,8 @@ def _new_rows(results) -> pd.DataFrame:
     df = pd.DataFrame(records)
     for col in ["料厚", "重量(kg)", "金額", "含利潤"] + [fee for _, fee, _ in TREATMENT_COLS]:
         df[col] = df[col].astype("float64")
-    df["材質"] = df["材質"].astype("object")
+    # 必須是文字型別：整欄都是 None 的 object 欄會被 Streamlit 當成「空值型別」，下拉選單無法寫入
+    df["材質"] = df["材質"].astype("string")
     return df
 
 
@@ -353,6 +354,21 @@ def _on_fee_default_change(key: str, fee_col: str, flag_col: str):
 
 def _on_profit_change():
     st.session_state.cadq_profit = st.session_state.cadq_profit_input
+    _recompute_rows()
+
+
+def _apply_bulk_material():
+    """批次設定材質：套用到全部列，或只套用到還沒選材質的列"""
+    df = st.session_state.cadq_rows
+    material = st.session_state.cadq_bulk_material
+    if df is None or not material:
+        return
+    only_empty = st.session_state.cadq_bulk_scope == "只套用到未選材質的列"
+    for i in range(len(df)):
+        if only_empty and isinstance(df.at[i, "材質"], str) and df.at[i, "材質"]:
+            continue
+        df.at[i, "材質"] = material
+    st.session_state.cadq_editor_ver += 1
     _recompute_rows()
 
 
@@ -571,7 +587,17 @@ def _render_preview():
         return
 
     st.subheader(f"📋 報價預覽表（共 {len(df)} 個檔案）")
-    st.caption("材質、料厚、表面處理、備註可直接編輯；金額 = 重量 × 單價 + 表面處理費，含利潤 = 金額 × (1 + 利潤%)。"
+
+    c_mat, c_scope, c_btn = st.columns([1, 2, 1], vertical_alignment="bottom")
+    with c_mat:
+        st.selectbox("批次設定材質", MATERIALS, key="cadq_bulk_material")
+    with c_scope:
+        st.radio("套用範圍", ["套用到全部列", "只套用到未選材質的列"], key="cadq_bulk_scope", horizontal=True)
+    with c_btn:
+        st.button("套用材質", on_click=_apply_bulk_material, width="stretch")
+
+    st.caption("材質、料厚、表面處理、備註可直接編輯：**雙擊**儲存格（或點一下後按 Enter）開啟下拉選單或輸入框。"
+               "金額 = 重量 × 單價 + 表面處理費，含利潤 = 金額 × (1 + 利潤%)。"
                "要刪除某列：勾選該列最左側方框，再按表格右上角的垃圾桶。")
 
     editor_key = f"cadq_rows_editor_{st.session_state.cadq_editor_ver}"
