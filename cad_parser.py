@@ -1,111 +1,88 @@
 """
-cad_parser.py - 3D CAD 解析與報表產出模組
-Version: v2.9.5_20261022
-Description: 專責 3D STEP/IGES 管道，與 2D DXF 管道完全分離。
-             修正 Excel 匯出邏輯：嚴格對齊 template.xlsm 與 xlsm 副檔名與 MIME 類型。
+cad_parser.py - 3D CAD 幾何解析與視圖產生模組
+Version: v3.0.0_20261023
+Description: 讀取 STEP/IGES，計算 OBB/AABB 素材尺寸、板金料厚，並產生
+             第三角法四視圖圖卡與單張等角示意圖。報表輸出移到 report_export.py。
 
 版本紀錄
 --------
+v3.0.0_20261023：
+    1. 新增 measure_sheet_thickness()：以「成對平行平面 / 同軸圓柱面」的距離
+       判斷板金料厚，並用體積 ÷ (表面積 ÷ 2) 交叉檢查，不像板金件時標示 suspicious。
+    2. 四視圖產生時另存等角圖（iso_image_path），供 Excel「示意圖」欄與預覽表使用。
+       解析結果新增 solid_count / is_assembly，2 個以上實體視為組立件。
+    3. 四視圖改用 HLRBRep_PolyAlgo（多邊形近似隱藏線）取得投影線、直接以 PIL 繪製：
+       組立件從每個視角數十秒降到 1 秒內，且不再需要 cairosvg / 系統 Cairo 函式庫。
+    4. 暫存檔統一加上 TEMP_PREFIX 前綴，新增 cleanup_stale_temp_files() 清理逾時暫存。
+    5. Excel / Word 輸出搬到 report_export.py；移除 2D 殘留與客戶表頭資訊。
 v2.9.5_20261022：
-    1. 修正旋轉零件尺寸多 1mm：Bnd_OBB 回傳值帶 +2e-7 的容差雜訊（100 會變
-       100.0000002），原本直接 math.ceil 會進位成 101。實測理論 100x50x10 的零件
-       旋轉 15/30/45 度會輸出 101*51*11。新增 ceil_dim()，進位前先扣 1e-6。
-    2. 修正四視圖圖卡中文標籤變方框：原本只用 DejaVuSans（沒有 CJK 字形）。新增
-       load_label_font()，依序找 Noto CJK / 文鼎 / 文泉驛 / Windows 微軟正黑體 /
-       macOS 蘋方，都找不到才退回 DejaVuSans。伺服器需安裝 CJK 字型套件
-       （例如 fonts-noto-cjk；portal 的 Dockerfile 已有 fonts-arphic-uming）。
+    修正旋轉零件尺寸多 1mm（ceil_dim 扣容差）與四視圖中文標籤變方框（load_label_font）。
 v2.9.4_20260904：
-    parse_cad_with_screenshot() 高度（三軸中最短的一軸）小於 1mm 時，
-    原本一律用 math.ceil() 無條件進位成 1mm，導致薄件（例如 0.2~0.9mm
-    的墊片/薄板）的高度數字失真。改成排序時保留原始浮點數（sorted_raw），
-    只有高度 < 1 時才跳過無條件進位、直接顯示四捨五入到小數點後兩位的
-    實際量測值；長度、寬度維持原本無條件進位邏輯不變。OBB/AABB 兩種模式
-    的體積比較邏輯（用於決定採用哪種包容盒）不受影響，因為兩種寫法算出
-    來的體積本來就一樣（進位後三數相乘，跟先排序再進位是同一個值）。
+    高度 < 1mm 時不無條件進位，改顯示實際量測值（四捨五入到小數點後兩位）。
 v2.9.3_20260830：
-    cairosvg 的 import 保護原本只接 ImportError，但 cairosvg 底層
-    （cairocffi）在 Windows 找不到原生 Cairo 函式庫時拋的是 OSError，
-    接不住會讓整支 cad_parser.py 在 import 階段直接崩潰，而不是照原本
-    設計優雅退化成 HAS_CAIROSVG=False。改成接 Exception。在整合到「Max
-    工具箱」入口網站、實際跑起來測試時發現（這台機器沒裝 Cairo 原生
-    函式庫），屬於既有程式的環境相容性問題，與本次整合的改動無關。
+    cairosvg 的 import 保護改接 Exception（Windows 缺 Cairo 時拋 OSError）。
 v2.9.2_20260830：
-    generate_excel_report() 尋找 template.xlsm/xlsx 的邏輯，原本用
-    os.path.exists("template.xlsm") 相對於「執行時的 working directory」找檔，
-    當這支程式被入口網站（Portal）當成模組載入、以不同目錄啟動時會找不到範本、
-    誤判成「沒有範本」而用空白活頁簿輸出。改成以本檔案自身所在目錄
-    （__file__）為準組出絕對路徑，不再受呼叫端 cwd 影響。
+    範本路徑改以 __file__ 所在目錄為準，不受呼叫端 cwd 影響。
 """
 
 import os
 import glob
 import math
+import time
 import uuid
 import tempfile
-from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+import numpy as np
 import cadquery as cq
 from PIL import Image, ImageDraw, ImageFont
-import openpyxl
-from openpyxl.styles import Font
 
-# 引入 docx 模組
-try:
-    import docx
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
-
-# 引入 CairoSVG 向量轉譯模組
-# 注意：cairosvg 底層透過 cairocffi 動態載入系統原生 Cairo 函式庫，Windows
-# 沒裝 GTK/Cairo 執行環境時會拋 OSError（不是 ImportError），原本只接
-# ImportError 接不住，會讓整支 cad_parser.py 在 import 階段直接崩潰，
-# 而不是照原本設計優雅退化成「沒有這個功能」。改成接 Exception。
-try:
-    import cairosvg
-    HAS_CAIROSVG = True
-except Exception:
-    HAS_CAIROSVG = False
-
-# 引入 OpenCASCADE 原生 Bnd_OBB 模組以進行精確幾何最小包容盒計算
+# 引入 OpenCASCADE 原生模組：OBB 最小包容盒、曲面型別判斷、面與面距離
 try:
     from OCP.Bnd import Bnd_OBB
     from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.TopAbs import TopAbs_IN, TopAbs_ON
+    from OCP.gp import gp_Pnt as _gp_Pnt
     HAS_OCP_OBB = True
 except ImportError:
     HAS_OCP_OBB = False
 
+# 視圖投影（多邊形隱藏線）
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.HLRBRep import HLRBRep_PolyAlgo, HLRBRep_PolyHLRToShape
+from OCP.HLRAlgo import HLRAlgo_Projector
+from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.GeomAbs import GeomAbs_Line
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopAbs import TopAbs_EDGE
+from OCP.TopoDS import TopoDS
 
-def safe_str(val: Any) -> str:
-    """安全轉為字串並去除首尾空白"""
-    if val is None:
-        return ""
-    try:
-        return str(val).strip()
-    except Exception:
-        return ""
+
+# 本程式產生的暫存檔都以此開頭，方便 cleanup_stale_temp_files() 辨識
+TEMP_PREFIX = "cadq_"
 
 
-def set_cell_value_safe(ws, row: int, col: int, value: Any, font: Optional[Font] = None):
-    """安全填寫儲存格：若遇到 MergedCell，寫入其最左上角的 Master Cell"""
-    try:
-        cell = ws.cell(row=row, column=col)
-        if type(cell).__name__ == 'MergedCell':
-            for rng in ws.merged_cells.ranges:
-                if cell.coordinate in rng:
-                    master_cell = ws.cell(row=rng.min_row, column=rng.min_col)
-                    master_cell.value = value
-                    if font:
-                        master_cell.font = font
-                    return
-        cell.value = value
-        if font:
-            cell.font = font
-    except Exception:
-        pass
+def temp_path(suffix: str) -> str:
+    """在系統暫存目錄組出一個帶 TEMP_PREFIX 的唯一檔名"""
+    return os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}{uuid.uuid4().hex[:12]}{suffix}")
+
+
+def cleanup_stale_temp_files(max_age_hours: float = 6.0) -> int:
+    """刪除超過 max_age_hours 的本程式暫存檔（使用者直接關分頁時留下的），回傳刪除數量"""
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}*")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 def is_valid_image(path: Optional[str]) -> bool:
@@ -139,7 +116,140 @@ def calculate_obb_dimensions(model: cq.Workplane) -> List[float]:
     return [bbox.xlen, bbox.ylen, bbox.zlen]
 
 
+def _cylinder_of(face) -> Optional[tuple]:
+    """回傳圓柱面的 (半徑, 軸心點 xyz, 軸方向 xyz)；非圓柱面回傳 None"""
+    try:
+        cyl = BRepAdaptor_Surface(face.wrapped).Cylinder()
+        ax = cyl.Axis()
+        loc, d = ax.Location(), ax.Direction()
+        return cyl.Radius(), (loc.X(), loc.Y(), loc.Z()), (d.X(), d.Y(), d.Z())
+    except Exception:
+        return None
+
+
+def _point_in_face(face, xyz) -> bool:
+    """投影點是否落在面的範圍內（含邊界）"""
+    try:
+        state = BRepClass_FaceClassifier(face.wrapped, _gp_Pnt(*map(float, xyz)), 1e-4).State()
+        return state in (TopAbs_IN, TopAbs_ON)
+    except Exception:
+        return False
+
+
+def _faces_overlap(f1, c1, n1, f2, c2, gap: float, extrema_budget: list) -> bool:
+    """兩個平行對向平面的投影是否重疊（中間是實體而非錯開的兩片）。
+    先用便宜的「中心點投影是否落在對面面內」判斷；判斷不出來（例如面中心剛好在孔上）
+    才用 BRepExtrema 算面與面最短距離，且限制呼叫次數（大面一次可達數十毫秒）。"""
+    if _point_in_face(f1, c2 + n1 * gap) or _point_in_face(f2, c1 - n1 * gap):
+        return True
+    if extrema_budget[0] <= 0:
+        return False
+    extrema_budget[0] -= 1
+    try:
+        dist = BRepExtrema_DistShapeShape(f1.wrapped, f2.wrapped)
+        return dist.IsDone() and abs(dist.Value() - gap) <= 1e-3
+    except Exception:
+        return False
+
+
+def measure_sheet_thickness(model: cq.Workplane) -> Dict[str, Any]:
+    """量測板金件料厚。
+
+    板金件的每個平面背後幾乎都有一個「距離固定、法向量相反、中間是實體」的平面，
+    兩者距離就是料厚；折彎處則是同軸圓柱面的半徑差。收集所有這類配對的距離，
+    以較小那面的面積加權，取權重最大的距離當料厚。
+
+    另用「體積 ÷ (表面積 ÷ 2)」粗估一次：板金件兩者應接近；實心塊會差很多，
+    這時 suspicious=True，交給使用者在預覽表確認。
+    """
+    result = {"thickness": None, "suspicious": True, "note": "無法判斷料厚"}
+    if not HAS_OCP_OBB:
+        return result
+    try:
+        shape = model.val()
+        faces = shape.Faces()
+        face_areas = [f.Area() for f in faces]
+        total_area = sum(face_areas) or 1.0
+        # 只有封閉實體的體積才有意義；純殼面（Shell）時略過體積交叉檢查
+        volume = sum(s.Volume() for s in shape.Solids())
+    except Exception:
+        return result
+
+    planes, cylinders = [], []
+    for f, area in zip(faces, face_areas):
+        try:
+            gtype = f.geomType()
+            if gtype == "PLANE":
+                planes.append((f, f.normalAt(), f.Center(), area))
+            elif gtype == "CYLINDER":
+                cyl = _cylinder_of(f)
+                if cyl:
+                    cylinders.append((cyl, area))
+        except Exception:
+            continue
+
+    weights: Dict[float, float] = {}
+
+    # 平面配對：法向量相反、對面平面在本面「後方」（中間是實體），且兩面投影確實重疊
+    # 以 numpy 一次算完所有平面兩兩組合（組立件可達數千個面，Python 雙迴圈太慢）
+    if len(planes) >= 2:
+        normals = np.array([[n.x, n.y, n.z] for _, n, _, _ in planes])
+        centers = np.array([[c.x, c.y, c.z] for _, _, c, _ in planes])
+        areas = np.array([a for _, _, _, a in planes])
+        dots = normals @ normals.T
+        # gap[i, j] = -(c_j - c_i)·n_i
+        gaps = -(centers @ normals.T).T + np.sum(centers * normals, axis=1)[:, None]
+        mask = np.triu(dots < -0.999, k=1) & (gaps > 1e-4)
+        ii, jj = np.nonzero(mask)
+        weights_ij = np.minimum(areas[ii], areas[jj])
+        order = np.argsort(-weights_ij)[:_MAX_PAIR_CHECKS]
+        extrema_budget = [_MAX_EXTREMA_CHECKS]
+        for k in order:
+            i, j = ii[k], jj[k]
+            gap = float(gaps[i, j])
+            if not _faces_overlap(planes[i][0], centers[i], normals[i], planes[j][0], centers[j], gap, extrema_budget):
+                continue
+            key = round(gap, 2)
+            weights[key] = weights.get(key, 0.0) + float(weights_ij[k])
+
+    # 折彎處：同軸圓柱面的半徑差（同樣用 numpy 一次比對所有組合）
+    if len(cylinders) >= 2:
+        radii = np.array([r for (r, _, _), _ in cylinders])
+        locs = np.array([p for (_, p, _), _ in cylinders])
+        dirs = np.array([d for (_, _, d), _ in cylinders])
+        c_areas = np.array([a for _, a in cylinders])
+        parallel = np.abs(np.abs(dirs @ dirs.T) - 1.0) <= 1e-4
+        # 軸心偏移量扣掉沿軸方向的分量，剩下的就是兩軸線間距
+        offsets = locs[None, :, :] - locs[:, None, :]
+        along = np.einsum("ijk,ik->ij", offsets, dirs)
+        perp = np.linalg.norm(offsets - along[:, :, None] * dirs[:, None, :], axis=2)
+        gaps = np.abs(radii[:, None] - radii[None, :])
+        mask = np.triu(parallel & (perp <= 1e-3) & (gaps > 1e-4), k=1)
+        for i, j in zip(*np.nonzero(mask)):
+            key = round(float(gaps[i, j]), 2)
+            weights[key] = weights.get(key, 0.0) + float(min(c_areas[i], c_areas[j]))
+
+    if not weights:
+        return result
+
+    thickness, best_weight = max(weights.items(), key=lambda kv: kv[1])
+    coverage = 2.0 * best_weight / total_area
+    suspicious = coverage < 0.5
+    if volume > 0:
+        ratio = (2.0 * volume / total_area) / thickness
+        suspicious = suspicious or not (0.7 <= ratio <= 1.15)
+
+    result.update({
+        "thickness": thickness,
+        "suspicious": bool(suspicious),
+        "note": "疑似非板金件，請確認料厚" if suspicious else "",
+    })
+    return result
+
+
 _DIM_EPS = 1e-6
+_MAX_PAIR_CHECKS = 400
+_MAX_EXTREMA_CHECKS = 40
 
 _CJK_FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -180,120 +290,137 @@ def load_label_font(size: int):
         return ImageFont.load_default()
 
 
-def render_single_view(
-    model: cq.Workplane, 
-    proj_dir: tuple, 
-    out_png_path: str, 
-    out_w: int = 800, 
-    out_h: int = 800
-) -> bool:
-    """將 3D 模型以指定的投影方向導出為 SVG，並使用 cairosvg 轉為指定大小之 PNG"""
-    temp_dir = tempfile.gettempdir()
-    unique_id = str(uuid.uuid4())[:8]
-    svg_path = os.path.join(temp_dir, f"view_{unique_id}.svg")
-
-    try:
-        cq.exporters.export(model, svg_path, opt={"projectionDir": proj_dir, "showHidden": False})
-        if not os.path.exists(svg_path) or os.path.getsize(svg_path) <= 0:
-            return False
-
-        if HAS_CAIROSVG:
-            cairosvg.svg2png(url=svg_path, write_to=out_png_path, output_width=out_w, output_height=out_h)
-            return is_valid_image(out_png_path)
-        return False
-    except Exception:
-        return False
-    finally:
-        if os.path.exists(svg_path):
-            try:
-                os.remove(svg_path)
-            except Exception:
-                pass
+# 視角：(視線方向 = 指向觀察者, 圖面 X 軸方向)。第三角法，Z 軸朝上。
+VIEW_AXES = {
+    "top": ((0, 0, 1), (1, 0, 0)),
+    "front": ((0, -1, 0), (1, 0, 0)),
+    "right": ((1, 0, 0), (0, 1, 0)),
+    "iso": ((1, 1, 1), (-1, 1, 0)),
+}
+_LINE_COLOR = (40, 40, 40, 255)
+# 圖卡每個象限可放視圖的範圍（下方要留給標籤文字）
+_VIEW_BOX_W, _VIEW_BOX_H = 680.0, 470.0
+_SUPERSAMPLE = 2
 
 
-def auto_crop_image_to_bbox(input_path: str, margin_px: int = 12) -> Optional[Image.Image]:
-    """精確裁切 PNG 圖像中非背景區域與異常延伸線，並附加安全像素 Margin"""
-    if not is_valid_image(input_path):
-        return None
-    try:
-        with Image.open(input_path) as img:
-            img_rgba = img.convert("RGBA")
-            w, h = img_rgba.size
-            mask = Image.new("L", (w, h), 0)
-            pixels_rgba = img_rgba.load()
-            pixels_mask = mask.load()
-
-            for y in range(h):
-                for x in range(w):
-                    r, g, b, a = pixels_rgba[x, y]
-                    if a > 10 and (r < 240 or g < 240 or b < 240):
-                        pixels_mask[x, y] = 255
-
-            bbox = mask.getbbox()
-            if not bbox:
-                return img_rgba.copy()
-
-            l, u, r, d = bbox
-            nl = max(0, l - margin_px)
-            nu = max(0, u - margin_px)
-            nr = min(w, r + margin_px)
-            nd = min(h, d + margin_px)
-            return img_rgba.crop((nl, nu, nr, nd))
-    except Exception:
-        return None
+def _mesh_shape(model: cq.Workplane):
+    """多邊形隱藏線演算法需要先把實體三角化；誤差取最大邊長的 0.2%"""
+    shape = model.val().wrapped
+    bbox = model.val().BoundingBox()
+    span = max(bbox.xlen, bbox.ylen, bbox.zlen, 1e-3)
+    BRepMesh_IncrementalMesh(shape, span * 0.002, False, 0.35, True)
+    return shape
 
 
-def generate_engineering_4views_card(model: cq.Workplane, final_png_path: str) -> bool:
+def project_view_lines(shape, view: str) -> List[np.ndarray]:
+    """以 HLRBRep_PolyAlgo（多邊形近似隱藏線）取得指定視角的可見線，回傳 2D 折線清單。
+
+    比 CadQuery SVG 匯出用的精確 HLR（HLRBRep_Algo）快一到兩個數量級，
+    組立件從數十秒降到 1 秒內；且直接畫成 PNG，不需要 Cairo。
+    """
+    direction, x_dir = VIEW_AXES[view]
+    projector = HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(*direction), gp_Dir(*x_dir)))
+    algo = HLRBRep_PolyAlgo()
+    algo.Load(shape)
+    algo.Projector(projector)
+    algo.Update()
+    to_shape = HLRBRep_PolyHLRToShape()
+    to_shape.Update(algo)
+
+    lines = []
+    for compound in (to_shape.VCompound(), to_shape.OutLineVCompound(), to_shape.Rg1LineVCompound()):
+        if compound.IsNull():
+            continue
+        explorer = TopExp_Explorer(compound, TopAbs_EDGE)
+        while explorer.More():
+            curve = BRepAdaptor_Curve(TopoDS.Edge_s(explorer.Current()))
+            first, last = curve.FirstParameter(), curve.LastParameter()
+            if curve.GetType() == GeomAbs_Line:
+                params = (first, last)
+            else:
+                params = np.linspace(first, last, 24)
+            pts = [curve.Value(p) for p in params]
+            lines.append(np.array([(p.X(), p.Y()) for p in pts]))
+            explorer.Next()
+    return lines
+
+
+def _lines_extent(lines: List[np.ndarray]):
+    if not lines:
+        return 0.0, 0.0, 1.0, 1.0
+    allpts = np.vstack(lines)
+    return allpts[:, 0].min(), allpts[:, 1].min(), allpts[:, 0].max(), allpts[:, 1].max()
+
+
+def draw_view_image(lines: List[np.ndarray], px_per_mm: float, margin_px: int = 10) -> Image.Image:
+    """把投影折線畫成透明背景的 RGBA 圖（先放大 2 倍畫再縮小，線條較平滑）"""
+    min_x, min_y, max_x, max_y = _lines_extent(lines)
+    s = px_per_mm * _SUPERSAMPLE
+    m = margin_px * _SUPERSAMPLE
+    w = max(1, int(math.ceil((max_x - min_x) * s)) + 2 * m)
+    h = max(1, int(math.ceil((max_y - min_y) * s)) + 2 * m)
+    img = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(img)
+    width = max(1, round(1.2 * _SUPERSAMPLE))
+    for line in lines:
+        xy = [((x - min_x) * s + m, (max_y - y) * s + m) for x, y in line]
+        if len(xy) >= 2:
+            draw.line(xy, fill=_LINE_COLOR, width=width, joint="curve")
+    return img.resize((max(1, w // _SUPERSAMPLE), max(1, h // _SUPERSAMPLE)), Image.LANCZOS)
+
+
+def _fit_scale(lines: List[np.ndarray], box_w: float, box_h: float) -> float:
+    min_x, min_y, max_x, max_y = _lines_extent(lines)
+    return min(box_w / max(max_x - min_x, 1e-3), box_h / max(max_y - min_y, 1e-3))
+
+
+def _save_on_white(img_rgba: Image.Image, out_path: str) -> bool:
+    """把透明背景的 RGBA 圖貼到白底後存成 PNG"""
+    bg = Image.new("RGB", img_rgba.size, (255, 255, 255))
+    bg.paste(img_rgba, (0, 0), img_rgba)
+    bg.save(out_path, "PNG")
+    return is_valid_image(out_path)
+
+
+def generate_engineering_4views_card(
+    model: cq.Workplane,
+    final_png_path: str,
+    iso_png_path: Optional[str] = None
+) -> Dict[str, bool]:
     """
     實作共同比例 (Common Scale Factor) 與第三角法對齊 (Projection Alignment) 的工程圖卡合成引擎。
+    若指定 iso_png_path，另把等角圖單獨存成一張（不受其他視圖成敗影響）。
+    回傳 {"card": 圖卡是否成功, "iso": 等角圖是否成功}。
     """
-    bbox_3d = model.val().BoundingBox()
-    x_len = max(0.1, bbox_3d.xlen)
-    y_len = max(0.1, bbox_3d.ylen)
-    z_len = max(0.1, bbox_3d.zlen)
+    status = {"card": False, "iso": False}
+    try:
+        shape = _mesh_shape(model)
+        lines = {view: project_view_lines(shape, view) for view in VIEW_AXES}
+    except Exception as e_proj:
+        print(f"[VIEW PROJECTION ERROR] {e_proj}")
+        return status
 
-    max_span = max(x_len, y_len, z_len)
-    cell_draw_area = 580.0
-    scale_ratio = cell_draw_area / max_span
-    
-    top_w = max(50, int(x_len * scale_ratio))
-    top_h = max(50, int(y_len * scale_ratio))
-    
-    front_w = max(50, int(x_len * scale_ratio))
-    front_h = max(50, int(z_len * scale_ratio))
-    
-    right_w = max(50, int(y_len * scale_ratio))
-    right_h = max(50, int(z_len * scale_ratio))
-
-    temp_dir = tempfile.gettempdir()
-    uid = str(uuid.uuid4())[:8]
-    p_top = os.path.join(temp_dir, f"top_{uid}.png")
-    p_front = os.path.join(temp_dir, f"front_{uid}.png")
-    p_right = os.path.join(temp_dir, f"right_{uid}.png")
-    p_iso = os.path.join(temp_dir, f"iso_{uid}.png")
+    if not lines["iso"]:
+        return status
+    img_iso = draw_view_image(lines["iso"], _fit_scale(lines["iso"], _VIEW_BOX_W, _VIEW_BOX_H), margin_px=14)
+    if iso_png_path:
+        status["iso"] = _save_on_white(img_iso, iso_png_path)
 
     try:
-        ok_t = render_single_view(model, (0, 0, 1), p_top, top_w + 120, top_h + 120)
-        ok_f = render_single_view(model, (0, -1, 0), p_front, front_w + 120, front_h + 120)
-        ok_r = render_single_view(model, (1, 0, 0), p_right, right_w + 120, right_h + 120)
-        ok_i = render_single_view(model, (1, 1, 1), p_iso, 800, 800)
-
-        if not (ok_t and ok_f and ok_r and ok_i):
-            return False
-
-        img_top = auto_crop_image_to_bbox(p_top, margin_px=8)
-        img_front = auto_crop_image_to_bbox(p_front, margin_px=8)
-        img_right = auto_crop_image_to_bbox(p_right, margin_px=8)
-        img_iso = auto_crop_image_to_bbox(p_iso, margin_px=14)
-
-        if not (img_top and img_front and img_right and img_iso):
-            return False
+        # 三個正投影共用同一比例，維持彼此尺寸關係；比例取「每個視圖都放得進象限」的最大值
+        # 平面圖 寬 X 高 Y、正面圖 寬 X 高 Z、右視圖 寬 Y 高 Z
+        bbox_3d = model.val().BoundingBox()
+        x_len, y_len, z_len = (max(v, 0.1) for v in (bbox_3d.xlen, bbox_3d.ylen, bbox_3d.zlen))
+        scale_ratio = min(_VIEW_BOX_W / max(x_len, y_len), _VIEW_BOX_H / max(y_len, z_len))
+        img_top = draw_view_image(lines["top"], scale_ratio, margin_px=8)
+        img_front = draw_view_image(lines["front"], scale_ratio, margin_px=8)
+        img_right = draw_view_image(lines["right"], scale_ratio, margin_px=8)
 
         canvas_w, canvas_h = 1600, 1200
         canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
 
         cx_left, cx_right = 420, 1180
-        cy_top, cy_bottom = 300, 900
+        cy_top, cy_bottom = 305, 885
 
         fw, fh = img_front.size
         front_x = cx_left - (fw // 2)
@@ -321,31 +448,41 @@ def generate_engineering_4views_card(model: cq.Workplane, final_png_path: str) -
 
         draw.text((30, 25), "PROJECTION: THIRD ANGLE", fill=(100, 100, 100, 255), font=font_small)
 
-        draw.text((cx_left - 60, cy_top + 240), "平面圖 TOP", fill=(60, 60, 60, 255), font=font)
-        draw.text((cx_left - 65, cy_bottom + 240), "正面圖 FRONT", fill=(60, 60, 60, 255), font=font)
-        draw.text((cx_right - 65, cy_bottom + 240), "右視圖 RIGHT", fill=(60, 60, 60, 255), font=font)
-        draw.text((cx_right - 80, cy_top + 240), "等角圖 ISOMETRIC", fill=(60, 60, 60, 255), font=font)
+        draw.text((cx_left - 60, cy_top + 248), "平面圖 TOP", fill=(60, 60, 60, 255), font=font)
+        draw.text((cx_left - 65, cy_bottom + 248), "正面圖 FRONT", fill=(60, 60, 60, 255), font=font)
+        draw.text((cx_right - 65, cy_bottom + 248), "右視圖 RIGHT", fill=(60, 60, 60, 255), font=font)
+        draw.text((cx_right - 80, cy_top + 248), "等角圖 ISOMETRIC", fill=(60, 60, 60, 255), font=font)
 
         draw.line([(800, 80), (800, 1120)], fill=(230, 230, 230, 255), width=2)
         draw.line([(80, 600), (1520, 600)], fill=(230, 230, 230, 255), width=2)
 
         canvas.convert("RGB").save(final_png_path, "PNG")
-        return is_valid_image(final_png_path)
+        status["card"] = is_valid_image(final_png_path)
+        return status
 
     except Exception as e_card:
         print(f"[ENGINEERING CARD ERROR] {str(e_card)}")
-        return False
-    finally:
-        for p in [p_top, p_front, p_right, p_iso]:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+        return status
+
+
+def load_cad_model(file_path: str) -> cq.Workplane:
+    """讀入 STEP / IGES 檔案成 CadQuery Workplane"""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ('.step', '.stp'):
+        return cq.importers.importStep(file_path)
+    try:
+        return cq.importers.importShape(file_path)
+    except Exception:
+        from OCP.IGESControl import IGESControl_Reader
+        reader = IGESControl_Reader()
+        reader.ReadFile(file_path)
+        reader.TransferRoots()
+        occ_shape = reader.Shape()
+        return cq.Workplane("XY").newObject([cq.Shape.cast(occ_shape)])
 
 
 def parse_cad_with_screenshot(file_path: str) -> Dict[str, Any]:
-    """讀取 3D CAD 檔案，進行 OBB/AABB 比對並產出工程三視圖圖卡"""
+    """讀取 3D CAD 檔案：OBB/AABB 素材尺寸、板金料厚、四視圖圖卡與等角示意圖"""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"找不到檔案：{file_path}")
 
@@ -354,18 +491,7 @@ def parse_cad_with_screenshot(file_path: str) -> Dict[str, Any]:
         raise ValueError(f"不支援的格式 '{ext}'")
 
     try:
-        if ext in ('.step', '.stp'):
-            model = cq.importers.importStep(file_path)
-        else:
-            try:
-                model = cq.importers.importShape(file_path)
-            except Exception:
-                from OCP.IGESControl import IGESControl_Reader
-                reader = IGESControl_Reader()
-                reader.ReadFile(file_path)
-                reader.TransferRoots()
-                occ_shape = reader.Shape()
-                model = cq.Workplane("XY").newObject([cq.Shape.cast(occ_shape)])
+        model = load_cad_model(file_path)
 
         raw_dims_obb = calculate_obb_dimensions(model)
         sorted_raw_obb = sorted(raw_dims_obb, reverse=True)
@@ -390,6 +516,9 @@ def parse_cad_with_screenshot(file_path: str) -> Dict[str, Any]:
         height_val = round(height_raw, 2) if height_raw < 1 else sorted_ceiled[2]
 
         dimensions_str = f"{length_val}*{width_val}*{height_val}"
+        thickness_info = measure_sheet_thickness(model)
+        # 2 個以上實體 = 組立件（例如板金 + 壓鉚螺帽），尺寸與料厚是以整體計算
+        solid_count = len(model.val().Solids())
     except Exception as e:
         return {
             "status": "error",
@@ -398,22 +527,18 @@ def parse_cad_with_screenshot(file_path: str) -> Dict[str, Any]:
             "error_message": f"CAD 幾何解析失敗: {str(e)}"
         }
 
-    img_path = None
+    card_png = temp_path(".png")
+    iso_png = temp_path(".png")
     image_error = None
-    unique_id = str(uuid.uuid4())[:8]
-    temp_dir = tempfile.gettempdir()
-    final_card_png = os.path.join(temp_dir, f"cad_card_{unique_id}.png")
-
     try:
-        success = generate_engineering_4views_card(model, final_card_png)
-        if success and is_valid_image(final_card_png):
-            img_path = final_card_png
-        else:
-            raise ValueError("工程三視圖圖卡合成失敗。")
+        views = generate_engineering_4views_card(model, card_png, iso_png)
+        if not views["card"]:
+            image_error = "工程四視圖圖卡合成失敗"
     except Exception as e_img:
+        views = {"card": False, "iso": False}
         image_error = f"{type(e_img).__name__}: {str(e_img)}"
+    if image_error:
         print(f"[CAD IMAGE ERROR] {os.path.basename(file_path)}: {image_error}")
-        img_path = None
 
     return {
         "status": "success",
@@ -425,221 +550,12 @@ def parse_cad_with_screenshot(file_path: str) -> Dict[str, Any]:
         "height": height_val,
         "unit": "mm",
         "used_mode": used_mode,
-        "image_path": img_path,
+        "thickness": thickness_info["thickness"],
+        "thickness_suspicious": thickness_info["suspicious"],
+        "thickness_note": thickness_info["note"],
+        "solid_count": solid_count,
+        "is_assembly": solid_count > 1,
+        "image_path": card_png if views["card"] else None,
+        "iso_image_path": iso_png if views["iso"] else None,
         "image_error": image_error
     }
-
-
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def generate_excel_report(
-    parsed_results: List[Dict[str, Any]],
-    output_excel_path: str,
-    header_info: Optional[Dict[str, Any]] = None
-):
-    """Excel 報表匯出：精確對齊 template.xlsm/xlsx 格式與 keep_vba 參數"""
-    template_candidates = ["template.xlsm", "Template.xlsm", "template.xlsx", "Template.xlsx"]
-    template_file = next(
-        (os.path.join(_MODULE_DIR, tf) for tf in template_candidates if os.path.exists(os.path.join(_MODULE_DIR, tf))),
-        None,
-    )
-    is_xlsm = template_file and template_file.lower().endswith('.xlsm')
-
-    if template_file:
-        wb = openpyxl.load_workbook(template_file, data_only=False, keep_vba=is_xlsm)
-        ws = wb.active
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "報價單"
-
-    kai_font_regular = Font(name="標楷體", size=11, bold=False)
-    kai_font_bold = Font(name="標楷體", size=11, bold=True)
-
-    if header_info and isinstance(header_info, dict):
-        set_cell_value_safe(ws, 4, 2, f"客戶名稱 : {safe_str(header_info.get('customer'))}", font=kai_font_regular)
-        set_cell_value_safe(ws, 5, 2, f"聯 絡 人 : {safe_str(header_info.get('contact'))}", font=kai_font_regular)
-        set_cell_value_safe(ws, 6, 2, f"聯絡電話 : {safe_str(header_info.get('phone'))}", font=kai_font_regular)
-        set_cell_value_safe(ws, 7, 2, f"傳    真 : {safe_str(header_info.get('fax'))}", font=kai_font_regular)
-
-    set_cell_value_safe(ws, 7, 15, datetime.now().strftime("%Y/%m/%d"), font=kai_font_regular)
-
-    start_row = 10
-    max_b_len, max_p_len = 12, 16
-
-    for idx, item in enumerate(parsed_results):
-        row_num = start_row + idx
-        ws.cell(row=row_num, column=1, value=idx + 1).font = kai_font_regular
-        
-        file_name = item.get("file_name", "")
-        ws.cell(row=row_num, column=2, value=file_name).font = kai_font_regular
-        max_b_len = max(max_b_len, len(str(file_name)))
-        
-        dims_str = item.get("dimensions_str", "")
-        ws.cell(row=row_num, column=16, value=dims_str).font = kai_font_bold
-        max_p_len = max(max_p_len, len(str(dims_str)))
-        
-        if "length" in item:
-            ws.cell(row=row_num, column=17, value=item["length"]).font = kai_font_bold
-        if "width" in item:
-            ws.cell(row=row_num, column=18, value=item["width"]).font = kai_font_bold
-        if "height" in item:
-            ws.cell(row=row_num, column=19, value=item["height"]).font = kai_font_bold
-        elif "thickness" in item and item["thickness"]:
-            ws.cell(row=row_num, column=19, value=item["thickness"]).font = kai_font_bold
-            
-        ws.cell(row=row_num, column=20, value=item.get("unit", "mm")).font = kai_font_regular
-
-        ws.cell(row=row_num, column=7, value=f"=E{row_num}*F{row_num}").font = kai_font_regular
-        ws.cell(row=row_num, column=10, value=f"=H{row_num}*I{row_num}").font = kai_font_regular
-        ws.cell(row=row_num, column=13, value=f"=K{row_num}*L{row_num}").font = kai_font_regular
-
-    ws.column_dimensions['B'].width = max(ws.column_dimensions['B'].width or 0, max_b_len + 6)
-    ws.column_dimensions['P'].width = max(ws.column_dimensions['P'].width or 0, max_p_len + 6)
-
-    total_row = 101
-    for r in range(10, ws.max_row + 1):
-        if "合計" in str(ws.cell(row=r, column=1).value or "") or "合計" in str(ws.cell(row=r, column=2).value or ""):
-            total_row = r
-            break
-
-    data_end_row = total_row - 1
-    set_cell_value_safe(ws, total_row, 7, f"=SUM(G10:G{data_end_row})", font=kai_font_bold)
-    set_cell_value_safe(ws, total_row, 10, f"=SUM(J10:J{data_end_row})", font=kai_font_bold)
-    set_cell_value_safe(ws, total_row, 13, f"=SUM(M10:M{data_end_row})", font=kai_font_bold)
-    set_cell_value_safe(ws, total_row, 15, f"=G{total_row}+J{total_row}+M{total_row}", font=kai_font_bold)
-
-    wb.save(output_excel_path)
-
-
-def generate_word_report(
-    parsed_results: List[Dict[str, Any]], 
-    output_word_path: str,
-    header_info: Optional[Dict[str, Any]] = None
-):
-    """
-    建立 Word 圖文報價單 (.docx)，實作 keep_with_next 原子區塊防跨頁保護 (Atomic CAD Block)。
-    支援 3D 機構件與 2D Mylar 模切材料雙軌報表產出。
-    """
-    if not HAS_DOCX:
-        raise ModuleNotFoundError("系統缺少 python-docx 套件，無法產生 Word 報表。")
-
-    doc = docx.Document()
-
-    for section in doc.sections:
-        section.top_margin = Inches(0.8)
-        section.bottom_margin = Inches(0.8)
-        section.left_margin = Inches(0.8)
-        section.right_margin = Inches(0.8)
-
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_run = title_p.add_run("⚙️ CAD 與 2D 模切材料報價明細單")
-    title_run.font.size = Pt(20)
-    title_run.font.bold = True
-    title_run.font.name = '標楷體'
-
-    today_str = datetime.now().strftime("%Y年%m月%d日")
-    sub_p = doc.add_paragraph()
-    sub_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    sub_run = sub_p.add_run(f"報價日期：{today_str}")
-    sub_run.font.size = Pt(10)
-    sub_run.font.name = '標楷體'
-
-    doc.add_paragraph().paragraph_format.space_after = Pt(4)
-
-    if header_info and isinstance(header_info, dict):
-        cust = safe_str(header_info.get("customer")) or "未填寫"
-        contact = safe_str(header_info.get("contact")) or "未填寫"
-        phone = safe_str(header_info.get("phone")) or "未填寫"
-        fax = safe_str(header_info.get("fax")) or "未填寫"
-
-        info_table = doc.add_table(rows=2, cols=2)
-        info_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        info_table.autofit = False
-
-        cells = info_table.rows[0].cells
-        cells[0].text = f"客戶名稱：{cust}"
-        cells[1].text = f"聯 絡 人：{contact}"
-
-        cells_2 = info_table.rows[1].cells
-        cells_2[0].text = f"聯絡電話：{phone}"
-        cells_2[1].text = f"傳    真：{fax}"
-
-        for row in info_table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        run.font.name = '標楷體'
-                        run.font.size = Pt(11)
-
-    doc.add_paragraph().paragraph_format.space_after = Pt(10)
-
-    for idx, item in enumerate(parsed_results):
-        if item.get("status") != "success":
-            continue
-
-        file_name = item.get("file_name", "")
-        dims_str = item.get("dimensions_str", "")
-        ftype = item.get("file_type", "3D")
-        img_path = item.get("image_path")
-        img_err = item.get("image_error")
-
-        p_item = doc.add_paragraph()
-        p_item.paragraph_format.keep_with_next = True
-        r_item = p_item.add_run(f"【項目 {idx+1}】 檔名：{file_name} ({'2D 模切' if ftype == '2D' else '3D 機構件'})")
-        r_item.font.bold = True
-        r_item.font.size = Pt(12)
-        r_item.font.name = '標楷體'
-
-        p_desc = doc.add_paragraph()
-        p_desc.paragraph_format.left_indent = Inches(0.2)
-        p_desc.paragraph_format.keep_with_next = True
-        
-        if ftype == '2D':
-            mat_type = item.get("material_type", "Mylar")
-            gross_area = item.get("gross_area", "待確認")
-            net_area = item.get("net_area", "待確認")
-            thickness = item.get("thickness", "待確認")
-            
-            r_d1 = p_desc.add_run(f"• 材料類型：{mat_type} (厚度: {thickness} mm)\n")
-            r_d1.font.bold = True
-            r_d1.font.name = '標楷體'
-            
-            r_d2 = p_desc.add_run(f"• 外形尺寸 (長×寬×厚)：{dims_str} mm\n• 外形總面積 (Gross Area)：{gross_area} mm²\n• 淨材料面積 (Net Area)：{net_area}\n")
-            r_d2.font.name = '標楷體'
-        else:
-            used_mode = item.get("used_mode", "OBB")
-            length = item.get("length", 0)
-            width = item.get("width", 0)
-            height = item.get("height", 0)
-            unit = item.get("unit", "mm")
-            
-            r_d1 = p_desc.add_run(f"• 採納素材尺寸 (長*寬*高)：{dims_str} {unit} ({used_mode} 模式)\n")
-            r_d1.font.bold = True
-            r_d1.font.name = '標楷體'
-            
-            r_d2 = p_desc.add_run(f"• 尺寸拆解數值：長 {length} {unit} / 寬 {width} {unit} / 高 {height} {unit}\n")
-            r_d2.font.name = '標楷體'
-
-        if is_valid_image(img_path):
-            try:
-                p_img = doc.add_paragraph()
-                p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                if idx < len(parsed_results) - 1:
-                    p_img.paragraph_format.keep_with_next = True
-                    
-                run_img = p_img.add_run()
-                run_img.add_picture(img_path, width=Inches(5.8))
-            except Exception as e_word_img:
-                p_err = doc.add_paragraph(f"   [ 無法產生視圖預覽 (Word插入例外: {str(e_word_img)}) ]")
-                p_err.runs[0].font.color.rgb = RGBColor(128, 128, 128)
-        else:
-            err_msg = f" ({img_err})" if img_err else ""
-            p_none = doc.add_paragraph(f"   [ 無法產生視圖預覽{err_msg} ]")
-            p_none.runs[0].font.color.rgb = RGBColor(128, 128, 128)
-
-        doc.add_paragraph().paragraph_format.space_after = Pt(8)
-
-    doc.save(output_word_path)

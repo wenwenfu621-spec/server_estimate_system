@@ -13,12 +13,11 @@ ENV/
 .vscode/
 .idea/
 
-# Temp Render Images & Output Excel
-*.png
-*.jpg
-*.xlsx
+# 測試或使用者上傳的 CAD 檔與輸出報表（範本與頭像要保留）
 *.stp
 *.step
 *.igs
 *.iges
-*.json
+*.docx
+*.xlsx
+!template.xlsx

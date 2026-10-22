@@ -1,59 +1,66 @@
 """
-app.py - CAD 自動報價與尺寸辨識系統
-Version: v2.12.0_20260831
-Description: 已移除 2D Mylar 辨識分頁，系統啟動後直接顯示 3D CAD 辨識功能。
-             合併原 pages/1_3D_CAD.py 內容，改為單頁應用（無多頁側邊導覽）。
+app.py - CAD 自動報價與尺寸辨識系統（板金件）
+Version: v3.0.0_20261023
+Description: 上傳 3D 模型 → 報價預覽表（可編輯材質、料厚、表面處理、利潤）→ 輸出 Excel / Word。
 
 版本紀錄
 --------
+v3.0.0_20261023：
+    1. 移除「客戶與報價表頭資訊」區塊。
+    2. 辨識後先顯示報價預覽表（與 Excel 同欄位），可選材質、修改料厚、勾選
+       表面處理（自動帶入預設加收金額，可逐格修改）、填寫利潤 %，確認後才輸出。
+    3. 材質單價表：SECC/SGCC 參考中鋼盤價公告、SUS 參考冷軋 304 亞洲價、AL 參考
+       LME 鋁價，皆標示出處，可手動修改（見 pricing.py）。
+    4. 組立件（2 個以上實體）在預覽表與上方提醒中標示。
+    5. 可分批上傳：每次辨識的檔案接在預覽表後面，最後一次輸出同一份 Excel / Word；
+       同檔名不重複加入，預覽表可刪除列。
+    6. 四視圖圖卡不在網頁顯示，只放在 Word 報告；Excel 改輸出 .xlsx 並在
+       「示意圖」欄貼等角圖。
+    7. 啟動時清理逾時暫存檔；session_state key 一律加 cadq_ 前綴避免與入口網站撞名。
 v2.12.0_20260831：
-    標題再縮小、再淡化：字體從原本的 h1 預設大小（約 44px）縮到 15px
-    （約 1/3），顏色從 #94a3b8 改成 rgba(148, 163, 184, 0.45)（同色調再
-    加上透明度），讓標題更不搶眼、隱約可見即可，跟畫面底圖融合。
+    標題縮小、淡化。
 v2.11.0_20260830：
-    標題從小灰字副標題（0.85rem）改成跟矽膠模成本估算統一規格的 <h1>
-    （字體大小維持瀏覽器/Streamlit 預設 h1 大小，跟矽膠模那支程式一致，
-    顏色沿用原本的淡灰色 #94a3b8、font-weight 400）；並改成
-    position: fixed 固定在視窗最上方，往下捲動頁面也會一直留在原地。用
-    components.html 注入的 JS 讀取 Streamlit 自己的頂端 header 位置/寬度
-    來對齊，若這支程式是被「Max 工具箱」入口網站載入、畫面上有
-    id="portal-greeting-bar" 的問候語列，標題列會自動疊在它正下方；獨立
-    執行（沒有問候語列）時則貼齊 header 正下方。用一個 spacer 元素撐開
-    原本標題的高度，避免標題變成 fixed 後，底下的內容跟著往上跳一段。
+    標題改為 position: fixed，對齊 Streamlit header 或入口網站問候語列。
 v2.10.0_20260830：
-    把整支程式的主畫面邏輯收進 render() 函式，讓這支 app.py 除了可以像以前
-    一樣用 `streamlit run app.py` 獨立執行，也可以被「Max 工具箱」入口網站
-    當成模組載入、在同一個 Streamlit process 裡呼叫 render() 顯示在中央工作
-    區。st.set_page_config() 與 inject_custom_elements()（版本標籤/署名）
-    只在獨立執行時呼叫一次，被入口網站載入時由入口網站統一處理，避免
-    st.set_page_config 被呼叫兩次而噴錯、以及版本標籤重複顯示。
-    同時把 has_xlsm 判斷 template.xlsm 是否存在的邏輯，改成以本檔案所在
-    目錄（__file__）為準的絕對路徑，不再依賴執行時的 working directory
-    （被入口網站以不同目錄啟動時，原本的相對路徑會找不到範本檔）。
+    主畫面收進 render()，可獨立執行，也可被「Max 工具箱」入口網站當模組載入。
+    st.set_page_config() 與 inject_custom_elements() 只在獨立執行時呼叫。
 """
 
-import streamlit as st
-import streamlit.components.v1 as components
 import os
+import io
 import sys
 import base64
-import tempfile
 from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+from PIL import Image
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(_MODULE_DIR)
-from cad_parser import parse_cad_with_screenshot, generate_excel_report, generate_word_report, is_valid_image
+from cad_parser import parse_cad_with_screenshot, is_valid_image, temp_path, cleanup_stale_temp_files
+from report_export import generate_excel_report, generate_word_report, compute_row
+from pricing import fetch_market_prices, MATERIALS
+
+APP_VERSION = "v3.0.0_20261023"
+
+# 表面處理：(勾選欄, 金額欄, 預設價 key)
+TREATMENT_COLS = [("噴漆", "噴漆費", "paint"), ("陽極", "陽極費", "anodize"), ("電鍍", "電鍍費", "plating")]
+DEFAULT_FEES = {"paint": 0.0, "anodize": 0.0, "plating": 0.0}
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def inject_custom_elements():
     """注入左下角版本號標籤與中央個人識別頭像徽章"""
-    app_dir = os.path.dirname(os.path.abspath(__file__))
     avatar_candidates = ["avatar.jpg", "avatar.jpeg", "avatar.png", "avatar.JPG", "avatar.PNG", "Avatar.png"]
     img_base64 = ""
     mime_type = "image/png"
 
     for af in avatar_candidates:
-        af_path = os.path.join(app_dir, af)
+        af_path = os.path.join(_MODULE_DIR, af)
         if os.path.exists(af_path):
             with open(af_path, "rb") as img_f:
                 img_base64 = base64.b64encode(img_f.read()).decode("utf-8")
@@ -81,38 +88,277 @@ def inject_custom_elements():
         font-style: italic; font-size: 0.95rem; color: #333333; white-space: nowrap;
     }}
     </style>
-    <div class="version-badge-left">Version: v2.9.0_20260825</div>
+    <div class="version-badge-left">Version: {APP_VERSION}</div>
     <div class="custom-footer-max">{avatar_html}<span class="custom-footer-text">Design by Max</span></div>
     """
     st.markdown(custom_css, unsafe_allow_html=True)
 
 
-def cleanup_3d_temp():
-    if "temp_files_3d" in st.session_state and st.session_state.temp_files_3d:
-        for fpath in st.session_state.temp_files_3d:
-            if fpath and os.path.exists(fpath):
+@st.cache_data(ttl=6 * 3600, show_spinner="正在抓取材質牌價…")
+def get_market_prices():
+    return fetch_market_prices()
+
+
+# ---------------------------------------------------------------- session state
+
+def _init_state():
+    defaults = {
+        "cadq_uploader_ver": 0,
+        "cadq_results": [],         # 成功解析的結果，順序與預覽表各列一致
+        "cadq_messages": [],        # 最近一次辨識的結果 / 錯誤 / 略過訊息
+        "cadq_rows": None,          # 預覽表 DataFrame
+        "cadq_fee_custom": [],      # 每列 {金額欄: 是否為手動修改}
+        "cadq_editor_ver": 0,
+        "cadq_temp_files": [],
+        "cadq_mat_table": None,     # 材質單價表 DataFrame
+        "cadq_mat_ver": 0,
+        "cadq_fees": dict(DEFAULT_FEES),
+        "cadq_profit": 0.0,
+        "cadq_excel": None,
+        "cadq_word": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if "cadq_temp_cleaned" not in st.session_state:
+        cleanup_stale_temp_files()
+        st.session_state.cadq_temp_cleaned = True
+
+
+def _cleanup_temp():
+    for fpath in st.session_state.get("cadq_temp_files") or []:
+        if fpath and os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+    st.session_state.cadq_temp_files = []
+
+
+def _reset_session():
+    _cleanup_temp()
+    st.session_state.cadq_results = []
+    st.session_state.cadq_messages = []
+    st.session_state.cadq_rows = None
+    st.session_state.cadq_fee_custom = []
+    st.session_state.cadq_excel = None
+    st.session_state.cadq_word = None
+    st.session_state.cadq_uploader_ver += 1
+
+
+def _invalidate_outputs():
+    st.session_state.cadq_excel = None
+    st.session_state.cadq_word = None
+
+
+# ---------------------------------------------------------------- 材質單價表
+
+def _build_mat_table(market) -> pd.DataFrame:
+    prices = market["prices"]
+    return pd.DataFrame(
+        [{"材質": m, "密度(g/cm³)": prices[m]["density"], "單價(元/kg)": prices[m]["price"], "來源": prices[m]["source"]}
+         for m in MATERIALS]
+    )
+
+
+def _material_lookup() -> dict:
+    table = st.session_state.cadq_mat_table
+    if table is None:
+        return {}
+    return {row["材質"]: (row["密度(g/cm³)"], row["單價(元/kg)"]) for _, row in table.iterrows()}
+
+
+def _on_mat_edit(editor_key: str):
+    table = st.session_state.cadq_mat_table.copy()
+    for idx, change in st.session_state[editor_key]["edited_rows"].items():
+        for col, val in change.items():
+            table.at[int(idx), col] = val
+    st.session_state.cadq_mat_table = table
+    st.session_state.cadq_mat_ver += 1
+    _recompute_rows()
+
+
+def _refetch_prices():
+    get_market_prices.clear()
+    st.session_state.cadq_mat_table = None
+
+
+# ---------------------------------------------------------------- 預覽表
+
+def _thumbnail_uri(path) -> str:
+    if not is_valid_image(path):
+        return None
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((160, 120))
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _row_notes(res) -> str:
+    notes = []
+    if res.get("is_assembly"):
+        notes.append(f"⚠ 組立件（{res.get('solid_count')} 個實體），尺寸與料厚以整體計算")
+    if res.get("thickness_suspicious"):
+        notes.append("⚠ " + (res.get("thickness_note") or "請確認料厚"))
+    if res.get("image_error"):
+        notes.append("示意圖產生失敗")
+    return "；".join(notes)
+
+
+def _new_rows(results) -> pd.DataFrame:
+    records = []
+    for res in results:
+        rec = {
+            "序項": 0,
+            "示意圖": _thumbnail_uri(res.get("iso_image_path")),
+            "品名": res["file_name"],
+            "材質": None,
+            "料厚": res.get("thickness"),
+            "尺寸": res["dimensions_str"],
+            "重量(kg)": None,
+        }
+        for flag, fee, _ in TREATMENT_COLS:
+            rec[flag] = False
+            rec[fee] = None
+        rec.update({"金額": None, "含利潤": None, "備註": "", "提醒": _row_notes(res)})
+        records.append(rec)
+    df = pd.DataFrame(records)
+    for col in ["料厚", "重量(kg)", "金額", "含利潤"] + [fee for _, fee, _ in TREATMENT_COLS]:
+        df[col] = df[col].astype("float64")
+    df["材質"] = df["材質"].astype("object")
+    return df
+
+
+def _append_rows(results):
+    """把新辨識的檔案接在預覽表後面（已填的內容保留）"""
+    new_df = _new_rows(results)
+    old_df = st.session_state.cadq_rows
+    df = new_df if old_df is None or old_df.empty else pd.concat([old_df, new_df], ignore_index=True)
+    df["序項"] = range(1, len(df) + 1)
+    st.session_state.cadq_rows = df
+    st.session_state.cadq_results = st.session_state.cadq_results + list(results)
+    st.session_state.cadq_fee_custom += [{fee: False for _, fee, _ in TREATMENT_COLS} for _ in results]
+
+
+def _delete_rows(indices):
+    removed = set(indices)
+    keep = [i for i in range(len(st.session_state.cadq_rows)) if i not in removed]
+    for i in removed:
+        for key in ("image_path", "iso_image_path"):
+            path = st.session_state.cadq_results[i].get(key)
+            if path and os.path.exists(path):
                 try:
-                    os.remove(fpath)
+                    os.remove(path)
                 except Exception:
                     pass
-        st.session_state.temp_files_3d = []
+    df = st.session_state.cadq_rows.iloc[keep].reset_index(drop=True)
+    df["序項"] = range(1, len(df) + 1)
+    st.session_state.cadq_rows = df
+    st.session_state.cadq_results = [st.session_state.cadq_results[i] for i in keep]
+    st.session_state.cadq_fee_custom = [st.session_state.cadq_fee_custom[i] for i in keep]
 
 
-def reset_3d_session():
-    cleanup_3d_temp()
-    st.session_state.parsed_3d_results = None
-    st.session_state.excel_3d_bytes = None
-    st.session_state.word_3d_bytes = None
-    st.session_state.uploader_3d_key += 1
+def _row_item(i: int, row, lookup: dict) -> dict:
+    """把預覽表的一列組成 report_export 使用的 item"""
+    res = st.session_state.cadq_results[i]
+    material = row["材質"] if isinstance(row["材質"], str) and row["材質"] else None
+    density, price = lookup.get(material, (None, None)) if material else (None, None)
+    item = {
+        "file_name": row["品名"],
+        "material": material,
+        "thickness": row["料厚"],
+        "dimensions_str": row["尺寸"],
+        "length": res["length"],
+        "width": res["width"],
+        "unit": res.get("unit", "mm"),
+        "used_mode": res.get("used_mode"),
+        "density": density,
+        "unit_price": price,
+        "remark": row["備註"] or "",
+        "iso_image_path": res.get("iso_image_path"),
+        "image_path": res.get("image_path"),
+        "image_error": res.get("image_error"),
+    }
+    for flag, fee, key in TREATMENT_COLS:
+        item[key] = row[fee] if row[flag] else None
+    return item
 
 
-def render() -> None:
-    """渲染 CAD 自動報價與尺寸辨識系統的完整功能介面。
+def _recompute_rows():
+    df = st.session_state.cadq_rows
+    if df is None or df.empty:
+        return
+    lookup = _material_lookup()
+    profit = st.session_state.cadq_profit or 0.0
+    for i, row in df.iterrows():
+        calc = compute_row(_row_item(i, row, lookup), profit)
+        df.at[i, "重量(kg)"] = calc["weight"]
+        df.at[i, "金額"] = calc["amount"]
+        df.at[i, "含利潤"] = calc["with_profit"]
+    _invalidate_outputs()
 
-    獨立執行（見檔案最下面的 __main__ 區塊）與被入口網站當成模組載入時
-    共用這支函式；st.set_page_config() 與版面裝飾不放在這裡，各自的呼叫端
-    只需要負責呼叫一次。
-    """
+
+def _on_rows_edit(editor_key: str):
+    df = st.session_state.cadq_rows
+    fees = st.session_state.cadq_fees
+    custom = st.session_state.cadq_fee_custom
+    flag_cols = {flag: (fee, key) for flag, fee, key in TREATMENT_COLS}
+    fee_cols = {fee: flag for flag, fee, _ in TREATMENT_COLS}
+
+    state = st.session_state[editor_key]
+    for idx, change in state["edited_rows"].items():
+        i = int(idx)
+        # 先處理勾選，再處理金額：同一次編輯若兩者都改，以手填金額為準
+        for col, val in change.items():
+            if col in flag_cols:
+                fee_col, key = flag_cols[col]
+                df.at[i, col] = bool(val)
+                df.at[i, fee_col] = fees.get(key, 0.0) if val else None
+                custom[i][fee_col] = False
+        for col, val in change.items():
+            if col in fee_cols:
+                if val is None or pd.isna(val):
+                    df.at[i, fee_cols[col]] = False
+                    df.at[i, col] = None
+                    custom[i][col] = False
+                else:
+                    df.at[i, fee_cols[col]] = True
+                    df.at[i, col] = float(val)
+                    custom[i][col] = True
+            elif col not in flag_cols:
+                df.at[i, col] = val
+
+    # 編輯的列號以刪除前為準，所以先套用編輯再刪列
+    if state.get("deleted_rows"):
+        _delete_rows(sorted(int(i) for i in state["deleted_rows"]))
+
+    st.session_state.cadq_editor_ver += 1
+    _recompute_rows()
+
+
+def _on_fee_default_change(key: str, fee_col: str, flag_col: str):
+    """預設加收金額變更時，同步更新已勾選、且沒有手動改過金額的列"""
+    new_value = st.session_state[f"cadq_fee_input_{key}"]
+    st.session_state.cadq_fees[key] = new_value
+    df = st.session_state.cadq_rows
+    if df is not None:
+        for i in range(len(df)):
+            if df.at[i, flag_col] and not st.session_state.cadq_fee_custom[i][fee_col]:
+                df.at[i, fee_col] = new_value
+        st.session_state.cadq_editor_ver += 1
+    _recompute_rows()
+
+
+def _on_profit_change():
+    st.session_state.cadq_profit = st.session_state.cadq_profit_input
+    _recompute_rows()
+
+
+# ---------------------------------------------------------------- 畫面
+
+def _render_title():
     st.markdown(
         """
         <div id="cad-title-spacer"></div>
@@ -163,29 +409,10 @@ def render() -> None:
         """,
         height=0,
     )
-    st.write("上傳 `.step`, `.stp`, `.igs`, `.iges` 3D 模型檔，自動計算 OBB/AABB 包容盒與第三角法三視圖。")
 
-    if "uploader_3d_key" not in st.session_state:
-        st.session_state.uploader_3d_key = 0
-    if "parsed_3d_results" not in st.session_state:
-        st.session_state.parsed_3d_results = None
-    if "excel_3d_bytes" not in st.session_state:
-        st.session_state.excel_3d_bytes = None
-    if "word_3d_bytes" not in st.session_state:
-        st.session_state.word_3d_bytes = None
-    if "temp_files_3d" not in st.session_state:
-        st.session_state.temp_files_3d = []
 
-    with st.expander("📝 客戶與報價表頭資訊填寫", expanded=True):
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            customer_input = st.text_input("客戶名稱", key=f"cust_3d_{st.session_state.uploader_3d_key}")
-            phone_input = st.text_input("聯絡電話", key=f"phone_3d_{st.session_state.uploader_3d_key}")
-        with col_c2:
-            contact_input = st.text_input("聯絡人", key=f"contact_3d_{st.session_state.uploader_3d_key}")
-            fax_input = st.text_input("傳真", key=f"fax_3d_{st.session_state.uploader_3d_key}")
-
-    with st.expander("📐 加工素材計算採用下列兩種方式之最小值", expanded=True):
+def _render_bbox_explainer():
+    with st.expander("📐 加工素材計算採用下列兩種方式之最小值", expanded=False):
         col_obb, col_aabb = st.columns(2)
 
         with col_obb:
@@ -230,123 +457,243 @@ def render() -> None:
                 "- 適用：外箱體積、正交零件估價"
             )
 
-    uploaded_3d_files = st.file_uploader(
+
+def _run_parsing(uploaded_files):
+    """辨識這一批檔案並接到預覽表後面；與清單中同檔名的檔案略過"""
+    _invalidate_outputs()
+    existing = {r["file_name"] for r in st.session_state.cadq_results}
+    messages, batch, todo = [], [], []
+    for up_file in uploaded_files:
+        if up_file.name in existing:
+            messages.append(("warning", f"⏭️ {up_file.name} 已在清單中，略過不重複加入。"))
+        else:
+            existing.add(up_file.name)
+            todo.append(up_file)
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    for idx, up_file in enumerate(todo):
+        fname = up_file.name
+        status_text.text(f"正在處理 3D 檔案 ({idx + 1}/{len(todo)}): {fname} ...")
+        tmp = temp_path(os.path.splitext(fname)[1])
+        with open(tmp, "wb") as f:
+            f.write(up_file.getvalue())
+
+        res = parse_cad_with_screenshot(tmp)
+        res["file_name"] = fname
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        if res.get("status") == "success":
+            batch.append(res)
+            for key in ("image_path", "iso_image_path"):
+                if res.get(key):
+                    st.session_state.cadq_temp_files.append(res[key])
+        else:
+            messages.append(("error", f"❌ {fname} 解析失敗：{res.get('error_message')}"))
+        progress_bar.progress((idx + 1) / max(1, len(todo)))
+
+    if batch:
+        _append_rows(batch)
+        messages.insert(0, ("success", f"🎉 已加入 {len(batch)} 個檔案，清單共 {len(st.session_state.cadq_results)} 個。"
+                                       "可繼續上傳下一批，最後再一起輸出。"))
+    st.session_state.cadq_messages = messages
+    st.session_state.cadq_editor_ver += 1
+    st.session_state.cadq_uploader_ver += 1   # 清空上傳框，方便上傳下一批
+    _recompute_rows()
+    st.rerun()
+
+
+def _render_price_settings():
+    if st.session_state.cadq_mat_table is None:
+        market = get_market_prices()
+        st.session_state.cadq_mat_table = _build_mat_table(market)
+        st.session_state.cadq_mat_ver += 1
+    market = get_market_prices()
+
+    with st.expander("💰 材質單價與表面處理設定", expanded=True):
+        st.markdown("**材質單價表**（可直接修改密度與單價，修改後預覽表即時重算）")
+        mat_key = f"cadq_mat_editor_{st.session_state.cadq_mat_ver}"
+        st.data_editor(
+            st.session_state.cadq_mat_table,
+            key=mat_key,
+            on_change=_on_mat_edit,
+            args=(mat_key,),
+            hide_index=True,
+            disabled=["材質", "來源"],
+            column_config={
+                "材質": st.column_config.TextColumn(width="small"),
+                "密度(g/cm³)": st.column_config.NumberColumn(min_value=0.0, step=0.01, format="%.2f", width="small"),
+                "單價(元/kg)": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f", width="small"),
+                "來源": st.column_config.TextColumn(width="large"),
+            },
+        )
+        csc = market.get("csc")
+        caption = f"抓取日期：{market['fetched']}；匯率 USD→TWD {market['fx']:.2f}（{market['fx_source']}）"
+        if csc:
+            caption += f"；中鋼公告：[{csc['title']}]({csc['url']})（{csc['date']}）"
+        st.caption(caption)
+        st.button("🔄 重新抓取牌價（會覆蓋手動修改的單價）", on_click=_refetch_prices)
+
+        st.markdown("**表面處理預設加收金額**（勾選後自動帶入，預覽表中每格仍可個別修改）")
+        cols = st.columns(len(TREATMENT_COLS) + 1)
+        for col, (flag, fee, key) in zip(cols, TREATMENT_COLS):
+            with col:
+                st.number_input(
+                    f"{flag}（元）", min_value=0.0, step=10.0,
+                    value=float(st.session_state.cadq_fees.get(key, 0.0)),
+                    key=f"cadq_fee_input_{key}",
+                    on_change=_on_fee_default_change, args=(key, fee, flag),
+                )
+        with cols[-1]:
+            st.number_input(
+                "利潤（%）", min_value=0.0, step=1.0,
+                value=float(st.session_state.cadq_profit),
+                key="cadq_profit_input", on_change=_on_profit_change,
+            )
+
+
+def _render_preview():
+    for level, text in st.session_state.cadq_messages:
+        getattr(st, level)(text)
+
+    assemblies = [r for r in st.session_state.cadq_results if r.get("is_assembly")]
+    if assemblies:
+        names = "、".join(f"{r['file_name']}（{r['solid_count']} 個實體）" for r in assemblies)
+        st.warning(
+            f"⚠️ 下列檔案為**組立件**：{names}。\n\n"
+            "組立件的尺寸、料厚與重量是以整個組立計算（可能包含螺帽、鉚釘等五金），請確認後再報價。"
+        )
+
+    df = st.session_state.cadq_rows
+    if df is None or df.empty:
+        return
+
+    st.subheader(f"📋 報價預覽表（共 {len(df)} 個檔案）")
+    st.caption("材質、料厚、表面處理、備註可直接編輯；金額 = 重量 × 單價 + 表面處理費，含利潤 = 金額 × (1 + 利潤%)。"
+               "要刪除某列：勾選該列最左側方框，再按表格右上角的垃圾桶。")
+
+    editor_key = f"cadq_rows_editor_{st.session_state.cadq_editor_ver}"
+    column_config = {
+        "序項": st.column_config.NumberColumn(width="small", pinned=True),
+        "示意圖": st.column_config.ImageColumn(width="small"),
+        "品名": st.column_config.TextColumn(width="medium"),
+        "材質": st.column_config.SelectboxColumn(options=MATERIALS, width="small"),
+        "料厚": st.column_config.NumberColumn(min_value=0.0, step=0.01, format="%.2f", width="small",
+                                            help="自動量測，可手動修改（mm）"),
+        "尺寸": st.column_config.TextColumn(width="small"),
+        "重量(kg)": st.column_config.NumberColumn(format="%.3f", width="small"),
+        "金額": st.column_config.NumberColumn(format="%.0f", width="small"),
+        "含利潤": st.column_config.NumberColumn(format="%.0f", width="small"),
+        "備註": st.column_config.TextColumn(width="medium"),
+        "提醒": st.column_config.TextColumn(width="large"),
+    }
+    for flag, fee, _ in TREATMENT_COLS:
+        column_config[flag] = st.column_config.CheckboxColumn(width="small")
+        column_config[fee] = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.0f", width="small")
+
+    st.data_editor(
+        df,
+        key=editor_key,
+        on_change=_on_rows_edit,
+        args=(editor_key,),
+        hide_index=True,
+        num_rows="delete",
+        row_height=64,
+        placeholder="",
+        disabled=["序項", "示意圖", "品名", "尺寸", "重量(kg)", "金額", "含利潤", "提醒"],
+        column_config=column_config,
+    )
+
+    total_amount = df["金額"].fillna(0).sum()
+    total_profit = df["含利潤"].fillna(0).sum()
+    c1, c2 = st.columns(2)
+    c1.metric("金額合計", f"{total_amount:,.0f} 元")
+    c2.metric(f"含利潤合計（{st.session_state.cadq_profit:g}%）", f"{total_profit:,.0f} 元")
+
+
+def _generate_outputs():
+    df = st.session_state.cadq_rows
+    lookup = _material_lookup()
+    items = [_row_item(i, row, lookup) for i, row in df.iterrows()]
+    profit = st.session_state.cadq_profit or 0.0
+
+    excel_path = temp_path(".xlsx")
+    st.session_state.cadq_temp_files.append(excel_path)
+    generate_excel_report(items, excel_path, profit_pct=profit)
+    with open(excel_path, "rb") as f:
+        st.session_state.cadq_excel = f.read()
+
+    try:
+        word_path = temp_path(".docx")
+        st.session_state.cadq_temp_files.append(word_path)
+        generate_word_report(items, word_path, profit_pct=profit)
+        with open(word_path, "rb") as f:
+            st.session_state.cadq_word = f.read()
+    except Exception as e_w:
+        st.session_state.cadq_word = None
+        st.warning(f"⚠️ Word 產生警告: {str(e_w)}")
+
+
+def _render_outputs():
+    st.markdown("---")
+    if st.session_state.cadq_rows is not None and not st.session_state.cadq_rows.empty:
+        if st.button("📤 確認並產生 Excel / Word", type="primary", width="stretch"):
+            with st.spinner("正在產生報表…"):
+                _generate_outputs()
+
+    today_str = datetime.now().strftime("%Y%m%d")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.session_state.cadq_excel:
+            st.download_button("📊 下載 Excel 報價單", st.session_state.cadq_excel,
+                               f"板金報價_{today_str}.xlsx", mime=XLSX_MIME, width="stretch")
+        else:
+            st.button("📊 Excel 尚未產生", disabled=True, width="stretch")
+    with col2:
+        if st.session_state.cadq_word:
+            st.download_button("📝 下載圖文報告 (.docx)", st.session_state.cadq_word,
+                               f"板金報價_{today_str}.docx", mime=DOCX_MIME, width="stretch")
+        else:
+            st.button("📝 Word 尚未產生", disabled=True, width="stretch")
+    with col3:
+        st.button("🔄 清空清單重新開始", on_click=_reset_session, width="stretch")
+    if st.session_state.cadq_rows is not None and not st.session_state.cadq_excel:
+        st.caption("預覽表修改後需重新按「確認並產生」，下載的檔案才會是最新內容。")
+
+
+def render() -> None:
+    """渲染 CAD 自動報價與尺寸辨識系統的完整功能介面。
+
+    獨立執行（見檔案最下面的 __main__ 區塊）與被入口網站當成模組載入時
+    共用這支函式；st.set_page_config() 與版面裝飾不放在這裡。
+    """
+    _init_state()
+    _render_title()
+    st.write("上傳 `.step`, `.stp`, `.igs`, `.iges` 板金 3D 模型檔，自動計算素材尺寸與料厚，"
+             "在預覽表確認材質、表面處理與利潤後，輸出 Excel 報價單與 Word 圖文報告。")
+    _render_bbox_explainer()
+
+    uploaded_files = st.file_uploader(
         "上傳 3D CAD 圖檔 (可多選)",
         type=["step", "stp", "igs", "iges"],
         accept_multiple_files=True,
-        key=f"uploader_3d_{st.session_state.uploader_3d_key}"
+        key=f"cadq_uploader_{st.session_state.cadq_uploader_ver}"
     )
+    if uploaded_files:
+        st.write(f"已選擇 **{len(uploaded_files)}** 個 3D 檔案。")
+        label = "➕ 辨識並加入清單" if st.session_state.cadq_results else "🎯 開始 3D 幾何辨識"
+        if st.button(label, type="primary", width="stretch"):
+            _run_parsing(uploaded_files)
 
-    if uploaded_3d_files:
-        st.write(f"已選擇 **{len(uploaded_3d_files)}** 個 3D 檔案。")
-
-        if st.button("🎯 開始 3D 幾何與工程視圖辨識", type="primary", width="stretch"):
-            cleanup_3d_temp()
-            parsed_results = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for idx, up_file in enumerate(uploaded_3d_files):
-                fname = up_file.name
-                ext = os.path.splitext(fname)[1]
-                status_text.text(f"正在處理 3D 檔案 ({idx+1}/{len(uploaded_3d_files)}): {fname} ...")
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(up_file.getvalue())
-                    tmp_path = tmp.name
-                    st.session_state.temp_files_3d.append(tmp_path)
-
-                res = parse_cad_with_screenshot(tmp_path)
-                res["file_name"] = fname
-                parsed_results.append(res)
-
-                if res.get("image_path"):
-                    st.session_state.temp_files_3d.append(res["image_path"])
-
-                progress_bar.progress((idx + 1) / len(uploaded_3d_files))
-
-            status_text.success("🎉 3D 檔案全部辨識完成！")
-
-            header_info = {"customer": customer_input, "contact": contact_input, "phone": phone_input, "fax": fax_input}
-
-            # --- 處理 Excel 副檔名與 MIME ---
-            has_xlsm = os.path.exists(os.path.join(_MODULE_DIR, "template.xlsm")) or os.path.exists(os.path.join(_MODULE_DIR, "Template.xlsm"))
-            export_ext = ".xlsm" if has_xlsm else ".xlsx"
-
-            excel_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=export_ext)
-            excel_path = excel_tmp.name
-            excel_tmp.close()
-            st.session_state.temp_files_3d.append(excel_path)
-
-            generate_excel_report(parsed_results, excel_path, header_info=header_info)
-            with open(excel_path, "rb") as f:
-                excel_bytes = f.read()
-
-            word_bytes = None
-            try:
-                word_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-                word_path = word_tmp.name
-                word_tmp.close()
-                st.session_state.temp_files_3d.append(word_path)
-
-                generate_word_report(parsed_results, word_path, header_info=header_info)
-                with open(word_path, "rb") as f_w:
-                    word_bytes = f_w.read()
-            except Exception as e_w:
-                st.warning(f"⚠️ Word 產生警告: {str(e_w)}")
-
-            st.session_state.parsed_3d_results = parsed_results
-            st.session_state.excel_3d_bytes = excel_bytes
-            st.session_state.word_3d_bytes = word_bytes
-
-    if st.session_state.parsed_3d_results:
-        st.subheader("📋 3D 辨識結果預覽")
-        for res in st.session_state.parsed_3d_results:
-            if res.get("status") == "success":
-                dims_esc = res['dimensions_str'].replace("*", "\\*")
-                mode = res.get("used_mode", "OBB")
-                with st.expander(f"📄 {res['file_name']} - 【尺寸：{dims_esc} mm ({mode})】"):
-                    col1, col2 = st.columns([2, 3])
-                    with col1:
-                        st.write(f"**檔名**：{res['file_name']}")
-                        st.write(f"**尺寸**：{dims_esc} mm ({mode})")
-                        st.write(f"**演算法**：{mode} 模式")
-                        st.write(f"**拆解數值**：長 {res.get('length')} / 寬 {res.get('width')} / 高 {res.get('height')}")
-                    with col2:
-                        if is_valid_image(res.get("image_path")):
-                            st.image(res["image_path"], caption="CAD 工程三視圖圖卡 (第三角法)", use_container_width=True)
-                        else:
-                            st.warning("⚠️ 預覽圖產生失敗")
-            else:
-                st.error(f"❌ {res['file_name']} 解析失敗：{res.get('error_message')}")
-
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        today_str = datetime.now().strftime("%Y%m%d")
-
-        # --- 輸出按鈕參數 ---
-        has_xlsm = os.path.exists(os.path.join(_MODULE_DIR, "template.xlsm")) or os.path.exists(os.path.join(_MODULE_DIR, "Template.xlsm"))
-        download_ext = ".xlsm" if has_xlsm else ".xlsx"
-        download_mime = "application/vnd.ms-excel.sheet.macroEnabled.12" if has_xlsm else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-        with col1:
-            st.download_button(
-                "📊 下載 Excel 報價單",
-                st.session_state.excel_3d_bytes,
-                f"3D_Report_{today_str}{download_ext}",
-                mime=download_mime,
-                width="stretch"
-            )
-        with col2:
-            if st.session_state.word_3d_bytes:
-                st.download_button("📝 下載圖文報告 (.docx)", st.session_state.word_3d_bytes, f"3D_Report_{today_str}.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", width="stretch")
-            else:
-                st.button("📝 Word 不可用", disabled=True, width="stretch")
-        with col3:
-            st.button("🔄 重置頁面", on_click=reset_3d_session, width="stretch")
+    if st.session_state.cadq_results or st.session_state.cadq_messages:
+        _render_price_settings()
+        _render_preview()
+        _render_outputs()
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="CAD 自動報價與尺寸辨識系統", page_icon="⚙️", layout="centered")
+    st.set_page_config(page_title="CAD 自動報價與尺寸辨識系統", page_icon="⚙️", layout="wide")
     inject_custom_elements()
     render()

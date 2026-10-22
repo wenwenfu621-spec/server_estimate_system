@@ -1,12 +1,67 @@
-# CAD Bounding Box Parser (.STEP / .IGS)
+# CAD 自動報價與尺寸辨識系統（板金件）
 
-本專案用於自動讀取並解析 `.step` / `.stp` 與 `.igs` / `.iges` 3D CAD 檔案的邊界外框尺寸（Bounding Box），並依「長 >= 寬 >= 高」規則輸出胚料估算尺寸。
+版本：v3.0.0_20261023
 
----
+上傳 `.step / .stp / .igs / .iges` 板金 3D 模型，系統會：
 
-## 🛠️ 環境需求與安裝步驟
+1. 計算 **OBB（旋轉最小包容盒）與 AABB（軸向外框）**，取體積較小者當素材尺寸（長 × 寬 × 高，mm）。
+2. 自動量測**料厚**（成對平行平面 / 同軸折彎圓柱面的距離），不像板金件時標示提醒。
+3. 判斷**組立件**（2 個以上實體），在畫面上提醒。
+4. 產生**報價預覽表**：選材質、改料厚、勾選表面處理（自動帶入預設加收金額，可逐格修改）、填利潤 %。
+5. 可**分批上傳**，最後輸出同一份 **Excel 報價單**（`.xlsx`，等角示意圖 + 公式）與 **Word 圖文報告**（含四視圖）。
 
-### 1. 克隆 GitHub 專案
+## 檔案
+
+| 檔案 | 用途 |
+|---|---|
+| `app.py` | Streamlit 介面，入口函式 `render()`（可被入口網站載入） |
+| `cad_parser.py` | 幾何解析：尺寸、料厚、組立件判斷、四視圖與等角圖 |
+| `report_export.py` | Excel / Word 輸出，以及網頁與 Word 共用的金額計算 `compute_row()` |
+| `pricing.py` | 材質牌價抓取（中鋼盤價公告、304 亞洲價、LME 鋁價、匯率） |
+| `material_prices.json` | 材質基準表：密度、基準單價（元/kg）、溢價、備用匯率 |
+| `template.xlsm` | Excel 範本（工作表 `Main`；巨集不會被保留，輸出一律 `.xlsx`） |
+
+## 計算規則
+
+```
+重量(kg)   = 長 × 寬 × 料厚 × 密度 ÷ 1,000,000      （長、寬取素材尺寸最大的兩邊）
+金額       = 重量 × 單價(元/kg) + 噴漆 + 陽極 + 電鍍
+含利潤售價 = 金額 × (1 + 利潤%)
+```
+
+Excel 中以上皆為公式：改 `K4`（利潤 %）、料厚、單價或處理費都會連動。輔助欄 M–Q（長、寬、密度、重量、單價）輸出時隱藏。
+序號公式 `=IF(C="","",COUNTA($C$5:C))`：在中間插入列後，下方序號自動重排；新插入的列請用 Ctrl+D 從上一列複製公式。
+
+## 材質單價來源
+
+| 材質 | 線上來源 | 說明 |
+|---|---|---|
+| SECC / SGCC | 中鋼新聞中心「月盤盤價」公告 | 中鋼只公布**調幅**，單價取自 `material_prices.json` 基準價，畫面提示最新調幅 |
+| SUS | 經濟部基本金屬供需監控平台「冷軋 304 亞洲價」 | 美元/公噸 × 匯率 ÷ 1000 + 溢價 |
+| AL | Westmetall 轉載之 LME 鋁現貨結算價 | 美元/公噸 × 匯率 ÷ 1000 + 溢價 |
+
+任何來源抓不到時退回基準表價格，不影響報價。結果快取 6 小時，畫面上可手動重新抓取，也可直接修改單價。
+**請定期依採購實際進價更新 `material_prices.json` 的 SECC / SGCC 基準價**，並把 `csc_basis` 改成已套用的那一期中鋼公告標題。
+
+## 本機執行
+
 ```bash
-git clone [https://github.com/](https://github.com/)<your-username>/cad-boundingbox-parser.git
-cd cad-boundingbox-parser
+python -m venv .venv
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+已驗證 Python 3.12.10。四視圖改用 OpenCASCADE 多邊形隱藏線演算法直接以 Pillow 繪製，**不需要 Cairo**。
+
+## 部署（Streamlit Community Cloud）
+
+- 會讀 repo 根目錄的 `requirements.txt`（已鎖版本）與 `packages.txt`（apt 套件）。
+- `packages.txt` 含 `fonts-noto-cjk`：四視圖的中文標籤需要 CJK 字型，否則會變方框。
+- 若由「Max 工具箱」入口網站在執行期載入，請把 `packages.txt` 內容同步到入口網站 repo 根目錄。
+
+## 已知限制
+
+- 程式假設 CAD 檔單位為 mm，不做單位換算。
+- 重量以「外框長 × 寬 × 料厚」計算，有折彎的零件會小於實際展開料重。
+- 組立件的尺寸、料厚、重量以整體計算（含螺帽等五金），畫面會提醒。
+- 預覽清單存在瀏覽器工作階段：重新整理頁面或閒置斷線後清單會消失，同一份報價請在同一次開啟頁面內完成。

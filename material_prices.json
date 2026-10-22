@@ -1,0 +1,13 @@
+{
+  "_說明": "材質基準表。price 單位為新台幣元/kg，density 單位為 g/cm³。SECC/SGCC 的 price 為基準價（中鋼只公布調幅，請依採購實際進價更新）；SUS/AL 線上抓價成功時改用『線上價 + premium』，premium 可填板材加工溢價。fx_usd_twd 為抓不到匯率時的備用值。",
+  "updated": "2026-10-22",
+  "csc_basis": "中鋼一一五年十一月盤盤價",
+  "fx_usd_twd": 32.0,
+  "materials": {
+    "SECC":  {"density": 7.85, "price": 33.0,  "premium": 0.0, "label": "電鍍鋅鋼板"},
+    "SGCC":  {"density": 7.85, "price": 31.0,  "premium": 0.0, "label": "熱浸鍍鋅鋼板"},
+    "SUS":   {"density": 7.93, "price": 95.0,  "premium": 0.0, "label": "不銹鋼 304"},
+    "AL":    {"density": 2.70, "price": 110.0, "premium": 0.0, "label": "鋁 5052/6061"},
+    "Other": {"density": 7.85, "price": 0.0,   "premium": 0.0, "label": "其他（自行填寫）"}
+  }
+}

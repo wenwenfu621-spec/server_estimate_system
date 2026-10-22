@@ -1,7 +1,6 @@
-libcairo2
 libgl1
 libglu1-mesa
 libx11-6
 libxext6
 libxrender1
-tesseract-ocr
+fonts-noto-cjk
