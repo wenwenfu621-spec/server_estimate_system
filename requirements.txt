@@ -1,0 +1,10 @@
+streamlit
+cadquery
+ezdxf
+openpyxl
+python-docx
+Pillow
+cairosvg
+pypdf
+pypdfium2
+pytesseract
