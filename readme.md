@@ -14,7 +14,7 @@
 
 | 檔案 | 用途 |
 |---|---|
-| `app.py` | Streamlit 介面，入口函式 `render()`（可被入口網站載入） |
+| `app.py` | Streamlit 介面，主畫面在 `render()` |
 | `cad_parser.py` | 幾何解析：尺寸、料厚、組立件判斷、四視圖與等角圖 |
 | `report_export.py` | Excel / Word 輸出，以及網頁與 Word 共用的金額計算 `compute_row()` |
 | `pricing.py` | 材質牌價抓取（中鋼盤價公告、304 亞洲價、LME 鋁價、匯率） |
@@ -57,7 +57,6 @@ streamlit run app.py
 
 - 會讀 repo 根目錄的 `requirements.txt`（已鎖版本）與 `packages.txt`（apt 套件）。
 - `packages.txt` 含 `fonts-noto-cjk`：四視圖的中文標籤需要 CJK 字型，否則會變方框。
-- 若由「Max 工具箱」入口網站在執行期載入，請把 `packages.txt` 內容同步到入口網站 repo 根目錄。
 
 ## 已知限制
 
